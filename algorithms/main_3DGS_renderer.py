@@ -10,8 +10,6 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from ..mesh_processer.mesh import PointCloud
-
 pytorch3d_capable = True
 try:
     import pytorch3d
@@ -30,8 +28,8 @@ from diff_gaussian_rasterization import (
 from simple_knn._C import distCUDA2
 
 from ..shared_utils.sh_utils import eval_sh, SH2RGB, RGB2SH
-from ..mesh_processer.mesh import Mesh
-from ..mesh_processer.mesh_utils import decimate_mesh, clean_mesh
+from ..mesh_processer.mesh import Mesh, PointCloud
+from ..mesh_processer.mesh_utils import construct_list_of_gs_attributes, write_gs_ply, read_gs_ply
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
@@ -285,7 +283,7 @@ class GaussianModel:
         self._features_dc = torch.empty(0) # diffuse color
         self._features_rest = torch.empty(0) # spherical harmonic coefficients
         self._scaling = torch.empty(0)
-        self._rotation = torch.empty(0)
+        self._rotation = torch.empty(0) # (w, x, y, z)
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -500,20 +498,11 @@ class GaussianModel:
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
                 return lr
-
-    def construct_list_of_attributes(self):
-        l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
-        # All channels except the 3 DC
-        for i in range(self._features_dc.shape[1]*self._features_dc.shape[2]):
-            l.append('f_dc_{}'.format(i))
-        for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
-            l.append('f_rest_{}'.format(i))
-        l.append('opacity')
-        for i in range(self._scaling.shape[1]):
-            l.append('scale_{}'.format(i))
-        for i in range(self._rotation.shape[1]):
-            l.append('rot_{}'.format(i))
-        return l
+            
+    def reset_opacity(self):
+        opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
+        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+        self._opacity = optimizable_tensors["opacity"]
     
     def get_points_cloud(self):
         xyz = self._xyz.detach().cpu().numpy()
@@ -521,13 +510,8 @@ class GaussianModel:
         shs = self.get_features.detach().cpu().numpy()
         pcd = PointCloud(points=xyz, colors=SH2RGB(shs), normals=normals)
         return pcd
-    
-    def get_mesh(self):
-        xyz = self._xyz.detach().cpu().numpy()
 
-    def save_ply(self, path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-
+    def to_ply(self):
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
@@ -535,59 +519,20 @@ class GaussianModel:
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        
+        return write_gs_ply(xyz, normals, f_dc, f_rest, opacities, scale, rotation, construct_list_of_gs_attributes(self._features_dc, self._features_rest, self._scaling, self._rotation))
 
-        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
-
-        elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
-        elements[:] = list(map(tuple, attributes))
-        el = PlyElement.describe(elements, 'vertex')
-        PlyData([el]).write(path)
-
-    def reset_opacity(self):
-        opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
-        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
-        self._opacity = optimizable_tensors["opacity"]
-
-    def load_ply(self, path):
-        plydata = PlyData.read(path)
-
-        xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
-                        np.asarray(plydata.elements[0]["y"]),
-                        np.asarray(plydata.elements[0]["z"])),  axis=1)
-        opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
-
-        print("Number of points at loading : ", xyz.shape[0])
-
-        features_dc = np.zeros((xyz.shape[0], 3, 1))
-        features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
-        features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
-        features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
-
-        extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
-        assert len(extra_f_names)==3*(self.max_sh_degree + 1) ** 2 - 3
-        features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
-        for idx, attr_name in enumerate(extra_f_names):
-            features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
-        features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
-
-        scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
-        scales = np.zeros((xyz.shape[0], len(scale_names)))
-        for idx, attr_name in enumerate(scale_names):
-            scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
-
-        rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
-        rots = np.zeros((xyz.shape[0], len(rot_names)))
-        for idx, attr_name in enumerate(rot_names):
-            rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
+    def create_from_ply(self, plydata):
+        xyz, features_dc, features_extra, opacities, scales, rots = read_gs_ply(plydata)
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
+        self.init_xyz = self._xyz.clone().detach()
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
         self.active_sh_degree = self.max_sh_degree
         
@@ -874,7 +819,7 @@ class GaussianModel:
 
         torch.cuda.empty_cache()
     
-class Renderer:
+class GaussianSplattingRenderer:
     def __init__(self, sh_degree=3, white_background=True, radius=1):
         
         self.sh_degree = sh_degree
@@ -894,6 +839,11 @@ class Renderer:
         if isinstance(input, Mesh):
             # load from 3D mesh
             self.gaussians.create_from_mesh(input, num_pts)
+        elif isinstance(input, PlyData):
+            self.gaussians.create_from_ply(input)
+        elif isinstance(input, PointCloud):
+            # load from a provided pcd
+            self.gaussians.create_from_pcd(input, 1)
         elif input is None:
             # init from random point cloud
             
@@ -913,9 +863,6 @@ class Renderer:
                 points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3))
             )
             self.gaussians.create_from_pcd(pcd, 10)
-        elif isinstance(input, PointCloud):
-            # load from a provided pcd
-            self.gaussians.create_from_pcd(input, 1)
         else:
             self.gaussians.create_from_uv_data(input)
 
